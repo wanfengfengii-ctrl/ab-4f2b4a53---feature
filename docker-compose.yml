@@ -1,0 +1,53 @@
+# 海上风机固件发布/续传服务编排
+#   构建并启动（含一次性 verify 校验）： docker compose up --build
+#   仅重复运行校验服务：                 docker compose run --rm verify
+# verify 在应用通过健康检查后才启动，退出码即测试结论（docker compose ps 可见）。
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: offshore-firmware-server:latest
+    container_name: firmware-app
+    environment:
+      # 容器内固定监听 8080；宿主机端口由 HOST_PORT 控制
+      PORT: "8080"
+      HOST: "0.0.0.0"
+      DATA_DIR: /data
+      MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-41943040}
+    ports:
+      # 可配置宿主机端口：HOST_PORT=9090 docker compose up -d
+      - "${HOST_PORT:-8080}:8080"
+    volumes:
+      # 持久卷：容器/服务重启后已发布固件仍可下载
+      - firmware-data:/data
+    restart: unless-stopped
+    healthcheck:
+      # 镜像内无 curl/wget，使用 Node 内置 fetch
+      test:
+        - CMD-SHELL
+        - "node -e \"fetch('http://127.0.0.1:'+(process.env.PORT||8080)+'/healthz').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))\""
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+
+  verify:
+    # 一次性服务：单元/集成测试 + 构建检查 + 发布后分段重组 API 冒烟
+    image: offshore-firmware-server:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: firmware-verify
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      APP_URL: http://app:8080
+    working_dir: /app
+    entrypoint: ["sh", "scripts/verify.sh"]
+    restart: "no"
+
+volumes:
+  firmware-data:
+    name: firmware-data

@@ -1,0 +1,15 @@
+{
+  "name": "offshore-firmware-server",
+  "version": "1.0.0",
+  "description": "海上风机控制器固件发布与分段续传服务（零运行时依赖）",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test test/range.test.js test/multipart.test.js test/store.test.js test/http.test.js",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "license": "MIT"
+}
