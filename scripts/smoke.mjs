@@ -1,6 +1,7 @@
 // 发布后分段重组 API 冒烟测试：对运行中的服务执行真实 HTTP 调用。
 // 覆盖：健康等待 → 发布 → 重复版本 409 → 摘要错误 422 → 全量/HEAD →
-// 闭区间/开放尾端/后缀 206 分段重组字节一致 → 416 → If-Range 不符回退 200。
+// 闭区间/开放尾端/后缀 206 分段重组字节一致 → 416 → If-Range 不符回退 200 →
+// 活动固件切换（前置版本 CAS、并发唯一成功、设备稳定地址取件、重启前最后一次切换生效）。
 import { createHash } from 'node:crypto';
 
 const BASE = process.env.APP_URL || `http://127.0.0.1:${process.env.PORT || '8080'}`;
@@ -30,14 +31,24 @@ async function waitHealthy(deadlineMs = 30_000) {
 
 const sha256 = (buf) => createHash('sha256').update(buf).digest('hex');
 
-async function publishRaw(version, data, hash) {
+async function publishRaw(version, data, hash, targetModel = 'WT-SMOKE') {
   const fd = new FormData();
   fd.set('version', version);
-  fd.set('targetModel', 'WT-SMOKE');
+  fd.set('targetModel', targetModel);
   fd.set('sha256', hash);
   fd.set('artifact', new Blob([data], { type: 'application/octet-stream' }), `${version}.bin`);
   return fetch(`${BASE}/api/firmware/releases`, { method: 'POST', body: fd });
 }
+
+const switchActive = (model, releaseVersion, expectedVersion) =>
+  fetch(`${BASE}/api/firmware/models/${encodeURIComponent(model)}/active`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ releaseVersion, expectedVersion }),
+  });
+
+const modelArtifact = (model) =>
+  `${BASE}/api/firmware/models/${encodeURIComponent(model)}/artifact`;
 
 async function main() {
   console.log(`[smoke] 目标服务：${BASE}`);
@@ -144,6 +155,130 @@ async function main() {
   const list = await fetch(`${BASE}/api/firmware/releases`).then((r) => r.json());
   check('发布清单含本次版本', Array.isArray(list.releases)
     && list.releases.some((x) => x.version === version && x.sha256 === digest));
+
+  // ============ 活动固件切换（本轮业务验收） ============
+  const model = `WT-ACT-${stamp}`;
+  const mkData = (seed, n) => {
+    const b = Buffer.alloc(n);
+    for (let i = 0; i < n; i++) b[i] = (i * 17 + seed + (i >>> 7)) & 0xff;
+    return b;
+  };
+  const actV1 = `act-1-${stamp}`;
+  const actV2 = `act-2-${stamp}`;
+  const actData1 = mkData(3, 120_000);
+  const actData2 = mkData(9, 150_000);
+  const actSha1 = sha256(actData1);
+  const actSha2 = sha256(actData2);
+  check('活动版本 v1 发布成功',
+    (await publishRaw(actV1, actData1, actSha1, model)).status === 201);
+  check('活动版本 v2 发布成功',
+    (await publishRaw(actV2, actData2, actSha2, model)).status === 201);
+
+  // 12) 未设置活动固件：设备取件 404
+  const noActive = await fetch(modelArtifact(model));
+  check('未切换前设备取件返回 404', noActive.status === 404, `got ${noActive.status}`);
+  await noActive.arrayBuffer().catch(() => {});
+
+  // 13) 首次切换前置版本非 null → 409，且活动版本仍不存在
+  const firstBad = await switchActive(model, actV1, '0.0.0-stale');
+  check('首次切换 expectedVersion 非 null 返回 409', firstBad.status === 409,
+    `got ${firstBad.status}`);
+  check('首次切换失败后设备仍 404',
+    (await fetch(modelArtifact(model))).status === 404);
+
+  // 14) 未知发布 / 型号不符 → 明确报错
+  const unknownRel = await switchActive(model, `missing-${stamp}`, null);
+  check('切换未知发布返回 404', unknownRel.status === 404, `got ${unknownRel.status}`);
+  const otherModelVer = `act-other-${stamp}`;
+  check('异型号发布件发布成功', (await publishRaw(
+    otherModelVer, actData1, actSha1, `WT-OTHER-${stamp}`)).status === 201);
+  const mismatch = await switchActive(model, otherModelVer, null);
+  check('型号不符返回 409 MODEL_MISMATCH', mismatch.status === 409
+    && (await mismatch.json()).error.code === 'MODEL_MISMATCH',
+    `got ${mismatch.status}`);
+
+  // 15) 首次切换 expectedVersion=null → 200，返回活动版本与 ETag
+  const sw1 = await switchActive(model, actV1, null);
+  const sw1Body = await sw1.json().catch(() => null);
+  check('首次切换成功返回 200', sw1.status === 200,
+    `got ${sw1.status} ${JSON.stringify(sw1Body)}`);
+  check('切换响应 ETag 为活动发布件摘要', sw1.headers.get('etag') === `"${actSha1}"`);
+  check('切换响应含活动版本', !!sw1Body && sw1Body.activeVersion === actV1
+    && sw1Body.previousVersion === null && sw1Body.targetModel === model);
+
+  // 16) 设备从稳定地址取得活动发布件：全量 + HEAD + 分段重组
+  const devFull = await fetch(modelArtifact(model));
+  const devFullBuf = Buffer.from(await devFull.arrayBuffer());
+  check('设备全量取件 200 且字节与 v1 一致',
+    devFull.status === 200 && sha256(devFullBuf) === actSha1);
+  check('设备端 ETag 与切换响应一致', devFull.headers.get('etag') === `"${actSha1}"`);
+  const devHead = await fetch(modelArtifact(model), { method: 'HEAD' });
+  check('设备端 HEAD 一致', devHead.status === 200
+    && Number(devHead.headers.get('content-length')) === actData1.length
+    && (await devHead.text()) === '');
+  const devParts = [];
+  for (const h of ['bytes=0-49999', 'bytes=50000-']) {
+    const pr = await fetch(modelArtifact(model), { headers: { Range: h } });
+    devParts.push(Buffer.from(await pr.arrayBuffer()));
+    check(`设备端 ${h} → 206`, pr.status === 206, `got ${pr.status}`);
+  }
+  check('设备端分段重组与 v1 完全一致', sha256(Buffer.concat(devParts)) === actSha1);
+  const devUnsat = await fetch(modelArtifact(model),
+    { headers: { Range: `bytes=${actData1.length}-` } });
+  check('设备端越界 Range → 416', devUnsat.status === 416
+    && devUnsat.headers.get('content-range') === `bytes */${actData1.length}`);
+  await devUnsat.arrayBuffer().catch(() => {});
+
+  // 17) expectedVersion 过期 → 409，活动版本不变
+  const staleSw = await switchActive(model, actV2, '0.0.0-stale');
+  check('前置版本过期返回 409', staleSw.status === 409
+    && (await staleSw.json()).error.code === 'VERSION_CONFLICT', `got ${staleSw.status}`);
+  const stillV1 = Buffer.from(await (await fetch(modelArtifact(model))).arrayBuffer());
+  check('409 后设备仍取得 v1 完整发布件', sha256(stillV1) === actSha1);
+
+  // 18) 前置版本匹配 → 切换 v2 成功；If-Range 旧摘要回退完整 200
+  const sw2 = await switchActive(model, actV2, actV1);
+  check('前置版本匹配切换 v2 成功', sw2.status === 200, `got ${sw2.status}`);
+  check('切换响应 previousVersion 正确', (await sw2.json()).previousVersion === actV1);
+  const devV2 = Buffer.from(await (await fetch(modelArtifact(model))).arrayBuffer());
+  check('设备随后取得 v2 完整发布件', sha256(devV2) === actSha2);
+  const ifRangeOld = await fetch(modelArtifact(model), {
+    headers: { Range: 'bytes=0-99', 'If-Range': `"${actSha1}"` },
+  });
+  const ifRangeOldBuf = Buffer.from(await ifRangeOld.arrayBuffer());
+  check('If-Range 为旧版本摘要时回退完整 200（不拼接新旧版本）',
+    ifRangeOld.status === 200 && sha256(ifRangeOldBuf) === actSha2);
+  const ifRangeNew = await fetch(modelArtifact(model), {
+    headers: { Range: 'bytes=0-99', 'If-Range': `"${actSha2}"` },
+  });
+  check('If-Range 为当前摘要时返回 206', ifRangeNew.status === 206);
+  await ifRangeNew.arrayBuffer();
+
+  // 19) 并发切换：同一前置版本下只有一个成功
+  const raceV3 = `act-3-${stamp}`;
+  const raceV4 = `act-4-${stamp}`;
+  const raceData3 = mkData(21, 80_000);
+  const raceData4 = mkData(33, 90_000);
+  await publishRaw(raceV3, raceData3, sha256(raceData3), model);
+  await publishRaw(raceV4, raceData4, sha256(raceData4), model);
+  const raceResults = await Promise.all([
+    ...Array.from({ length: 3 }, () => switchActive(model, raceV3, actV2)),
+    ...Array.from({ length: 3 }, () => switchActive(model, raceV4, actV2)),
+  ]);
+  const raceOks = raceResults.filter((r) => r.status === 200);
+  check('并发切换只有一个成功，其余 409', raceOks.length === 1
+    && raceResults.every((r) => r.status === 200 || r.status === 409),
+    `200×${raceOks.length} / ${raceResults.map((r) => r.status).join(',')}`);
+  const winnerVersion = (await raceOks[0].json()).activeVersion;
+  const winnerData = winnerVersion === raceV3 ? raceData3 : raceData4;
+  const afterRace = Buffer.from(await (await fetch(modelArtifact(model))).arrayBuffer());
+  check('并发后设备取得最后一次成功切换的完整发布件',
+    sha256(afterRace) === sha256(winnerData));
+
+  // 20) 按版本下载不受切换影响
+  const byVer = Buffer.from(await (await fetch(
+    `${BASE}/api/firmware/releases/${actV1}/artifact`)).arrayBuffer());
+  check('按版本下载 v1 字节不变', sha256(byVer) === actSha1);
 
   console.log(failures === 0
     ? `[smoke] 全部通过 ✅ (${BASE})`

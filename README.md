@@ -19,6 +19,17 @@
   - `If-None-Match` 命中返回 `304`
   - 所有成功响应的 `ETag`、`Content-Length`、`Content-Range` 均与实际字节严格一致
 - `GET /api/firmware/releases`：已发布版本清单
+- `POST /api/firmware/models/{targetModel}/active`：把不可变发布件切换为某型号的活动固件
+  - 请求体 JSON：`{"releaseVersion": "1.4.2", "expectedVersion": "1.4.1" | null}`
+  - 仅**型号一致**的发布件可被切换（不符返回 `409 MODEL_MISMATCH`；未知发布返回 `404`）
+  - `expectedVersion` 须等于切换前的活动版本（CAS）；**首次切换须为 `null`**
+  - 前置版本过期或并发竞争失败返回 `409 VERSION_CONFLICT`，活动版本不变；
+    同一时刻只有一个切换成功
+  - 成功返回 `200`、活动版本、`previousVersion` 与 `ETag: "<sha256>"`（活动发布件摘要）
+- `GET /api/firmware/models/{targetModel}/artifact`（亦支持 `HEAD`）：设备稳定取件地址
+  - 完整复用按版本下载的 `Range`、`If-Range`、`If-None-Match` 与 `200/206/304/416` 语义
+  - 活动版本在请求开始时一次性解析，**单次响应的字节与校验头同属一个版本**，绝不拼接新旧版本
+  - 尚未设置活动固件的型号返回 `404 ACTIVE_NOT_FOUND`
 - `GET /healthz`：健康检查
 
 ## 一致性保证
@@ -28,6 +39,10 @@
    并发重复版本由文件系统改名冲突兜底，返回 `409`，不破坏既有发布。
 3. ETag 即发布字节的 SHA-256；下载前校验磁盘文件大小与元数据一致。
 4. 已发布数据位于持久卷 `/data`，重启后自动加载；崩溃残留的暂存目录启动时清理。
+5. 活动固件切换经串行队列裁决：`expectedVersion` 校验、映射原子落盘（写临时文件再
+   `rename`）、内存提交依次完成；并发竞争只有一个成功，其余 `409` 且活动版本不变。
+   映射持久化于 `/data/active.json`，重启后保持；设备端单次响应的字节与 ETag 始终
+   来自同一个不可变发布件。
 
 ## 目录结构
 
@@ -37,7 +52,7 @@ src/
   multipart.js  零依赖流式 multipart/form-data 解析（背压、限额、临时文件清理）
   range.js      RFC 7233 单区间与 If-Range 解析
   store.js      原子发布、摘要校验、持久化元数据
-test/           node:test 单元 + HTTP 集成测试（41 项）
+test/           node:test 单元 + HTTP 集成测试（54 项，含活动固件切换验收）
 scripts/
   smoke.mjs     发布后分段重组 API 冒烟
   verify.sh     verify 一次性服务入口
@@ -85,6 +100,15 @@ curl -f -X POST http://localhost:8080/api/firmware/releases \
 curl -f -H 'Range: bytes=1048576-' \
   -H 'If-Range: "<sha256>"' \
   http://localhost:8080/api/firmware/releases/1.4.2/artifact -o part.bin
+
+# 运维切换：把 1.4.2 设为 WT-5000 的活动固件（首次切换 expectedVersion 为 null）
+curl -f -X POST http://localhost:8080/api/firmware/models/WT-5000/active \
+  -H 'Content-Type: application/json' \
+  -d '{"releaseVersion":"1.4.2","expectedVersion":null}'
+
+# 设备从稳定地址取件（活动版本切换后自动指向新发布件，地址不变）
+curl -f -H 'Range: bytes=0-1048575' \
+  http://localhost:8080/api/firmware/models/WT-5000/artifact -o fw.part
 ```
 
 ## 环境变量

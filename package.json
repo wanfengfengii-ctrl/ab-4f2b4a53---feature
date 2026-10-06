@@ -8,7 +8,7 @@
   },
   "scripts": {
     "start": "node src/server.js",
-    "test": "node --test test/range.test.js test/multipart.test.js test/store.test.js test/http.test.js",
+    "test": "node --test test/range.test.js test/multipart.test.js test/store.test.js test/http.test.js test/active.test.js",
     "smoke": "node scripts/smoke.mjs"
   },
   "license": "MIT"

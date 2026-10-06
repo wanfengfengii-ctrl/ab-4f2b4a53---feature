@@ -2,6 +2,7 @@
 // 目录结构：
 //   <data>/staging/<id>/{artifact,meta.json}   发布中的暂存区
 //   <data>/releases/<version>/{artifact,meta.json}  已发布（不可变）
+//   <data>/active.json                          各型号当前活动固件映射（原子写，重启保持）
 import {
   createReadStream,
   createWriteStream,
@@ -36,8 +37,13 @@ export class FirmwareStore {
     this.dataDir = dataDir;
     this.releasesDir = path.join(dataDir, 'releases');
     this.stagingDir = path.join(dataDir, 'staging');
+    this.activeFile = path.join(dataDir, 'active.json');
     /** @type {Map<string, any>} version -> meta */
     this.meta = new Map();
+    /** @type {Map<string, any>} targetModel -> { targetModel, version, previousVersion, switchedAt } */
+    this.active = new Map();
+    // 切换操作的串行队列：保证“读当前值-校验前置版本-落盘-提交”不被并发切换交错
+    this._activeQueue = Promise.resolve();
   }
 
   async init() {
@@ -65,6 +71,24 @@ export class FirmwareStore {
         this.meta.set(meta.version, Object.freeze({ ...meta }));
       } catch { /* 残缺目录：忽略，不污染已发布视图 */ }
     }
+
+    // 载入各型号活动固件映射（重启保持）。文件经原子写产生，缺失视为空映射；
+    // 与残缺发布目录的容忍策略一致，无法解析时按空映射启动而不阻断服务。
+    try {
+      const raw = JSON.parse(await readFile(this.activeFile, 'utf8'));
+      if (raw && typeof raw === 'object') {
+        for (const [model, rec] of Object.entries(raw)) {
+          if (rec && typeof rec.version === 'string' && VERSION_RE.test(rec.version)) {
+            this.active.set(model, Object.freeze({
+              targetModel: model,
+              version: rec.version,
+              previousVersion: typeof rec.previousVersion === 'string' ? rec.previousVersion : null,
+              switchedAt: rec.switchedAt || null,
+            }));
+          }
+        }
+      }
+    } catch { /* 无映射文件或内容损坏：按空映射启动 */ }
   }
 
   list() {
@@ -73,6 +97,63 @@ export class FirmwareStore {
 
   get(version) {
     return this.meta.get(version) || null;
+  }
+
+  /** 某型号当前活动固件记录；未设置返回 null */
+  getActive(targetModel) {
+    return this.active.get(targetModel) || null;
+  }
+
+  /**
+   * 将某型号的活动固件切换到指定发布版本（CAS 语义）。
+   * - 仅型号一致的发布件可被切换；
+   * - expectedVersion 必须等于切换前的活动版本（首次切换为 null）；
+   * - 并发切换经串行队列裁决，只有一个成功，其余抛 409 且活动版本不变。
+   * 映射先原子落盘再提交内存，重启后保持。
+   */
+  async switchActive(targetModel, releaseVersion, expectedVersion) {
+    const release = this.meta.get(releaseVersion);
+    if (!release) {
+      throw new StoreError(`发布版本 ${releaseVersion} 不存在`, 404, 'RELEASE_NOT_FOUND');
+    }
+    if (release.targetModel !== targetModel) {
+      throw new StoreError(
+        `发布版本 ${releaseVersion} 属于型号 ${release.targetModel}，不能切换为型号 ${targetModel} 的活动固件`,
+        409,
+        'MODEL_MISMATCH',
+      );
+    }
+
+    const run = this._activeQueue.then(async () => {
+      const prev = this.active.get(targetModel) || null;
+      const prevVersion = prev ? prev.version : null;
+      if (expectedVersion !== prevVersion) {
+        throw new StoreError(
+          `expectedVersion 与当前活动版本不符：期望 ${JSON.stringify(expectedVersion)}，`
+          + `当前 ${JSON.stringify(prevVersion)}`,
+          409,
+          'VERSION_CONFLICT',
+        );
+      }
+      const record = Object.freeze({
+        targetModel,
+        version: releaseVersion,
+        previousVersion: prevVersion,
+        switchedAt: new Date().toISOString(),
+      });
+      const next = new Map(this.active);
+      next.set(targetModel, record);
+      // 先原子落盘（写临时文件再 rename），成功后才提交内存视图
+      await writeFileAtomic(
+        this.activeFile,
+        JSON.stringify(Object.fromEntries(next), null, 2) + '\n',
+      );
+      this.active = next;
+      return record;
+    });
+    // 队列自身永不拒绝：前序切换失败不影响后续切换的裁决
+    this._activeQueue = run.catch(() => {});
+    return run;
   }
 
   artifactPath(version) {
