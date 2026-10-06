@@ -19,6 +19,19 @@
   - `If-None-Match` 命中返回 `304`
   - 所有成功响应的 `ETag`、`Content-Length`、`Content-Range` 均与实际字节严格一致
 - `GET /api/firmware/releases`：已发布版本清单
+- `POST /api/firmware/models/{targetModel}/active`：把某型号的**活动固件**切换到指定发布件
+  - 请求体：`{"releaseVersion": "1.4.2", "expectedVersion": "1.4.1"}`
+  - `expectedVersion` 为切换前活动版本的乐观并发令牌：字符串版本号或 `null`，
+    **首次切换必须为 `null`**；前置版本过期返回 `409 VERSION_CONFLICT`
+  - 仅型号一致的发布件可切换：型号不符返回 `409 MODEL_MISMATCH`；未知发布返回 `404 RELEASE_NOT_FOUND`
+  - 成功返回 `200`，载荷含 `activeVersion`、`switchedAt`、`sha256`、`size`，
+    并带与发布件一致的 `ETag`（设备可直接用作 `If-Range`）
+  - 并发竞争只有一个请求成功，其余 `409` 且活动版本不变；活动映射经重启保持
+- `GET /api/firmware/models/{targetModel}/artifact`（亦支持 `HEAD`）：设备稳定取件地址
+  - 始终下发**最后一次成功切换**的完整发布件；复用与按版本下载完全一致的
+    `HEAD`、`Range`、`If-Range`、`If-None-Match` 及 `200/206/304/416` 语义
+  - 单次响应的 `ETag`、`Content-Length`、`Content-Range` 与实际字节同属一个版本，
+    响应期间发生切换不会产生新旧版本拼接
 - `GET /healthz`：健康检查
 
 ## 一致性保证
@@ -27,19 +40,23 @@
 2. 通过校验后在暂存目录组装 `artifact` + `meta.json`，再以目录级原子 `rename` 发布；
    并发重复版本由文件系统改名冲突兜底，返回 `409`，不破坏既有发布。
 3. ETag 即发布字节的 SHA-256；下载前校验磁盘文件大小与元数据一致。
-4. 已发布数据位于持久卷 `/data`，重启后自动加载；崩溃残留的暂存目录启动时清理。
+4. 已发布数据位于持久卷 `/data`，重启后自动加载；崩溃残留的暂存目录/临时映射启动时清理。
+5. 活动映射（型号 → 版本）只持有指向不可变发布件的指针，以原子 `rename` 落盘到
+   `active/` 并在切换临界区内更新；切换按型号串行，`expectedVersion` 乐观校验保证
+   并发竞争恰有一个成功。设备下载在请求开始即锁定单一版本元数据，
+   故任一字节及其校验头都来自同一发布件，切换不改变进行中的响应。
 
 ## 目录结构
 
 ```
 src/
-  server.js      HTTP 路由、发布与 Range 下载
+  server.js      HTTP 路由、发布、活动切换与 Range 下载
   multipart.js  零依赖流式 multipart/form-data 解析（背压、限额、临时文件清理）
   range.js      RFC 7233 单区间与 If-Range 解析
-  store.js      原子发布、摘要校验、持久化元数据
-test/           node:test 单元 + HTTP 集成测试（41 项）
+  store.js      原子发布、摘要校验、持久化元数据与型号活动映射
+test/           node:test 单元 + HTTP 集成测试（60 项）
 scripts/
-  smoke.mjs     发布后分段重组 API 冒烟
+  smoke.mjs     发布分段重组 + 活动切换/稳定地址 API 冒烟
   verify.sh     verify 一次性服务入口
 Dockerfile      可构建应用镜像
 docker-compose.yml  健康检查 + 持久卷 + 可配置宿主机端口 + verify 一次性服务
@@ -85,6 +102,18 @@ curl -f -X POST http://localhost:8080/api/firmware/releases \
 curl -f -H 'Range: bytes=1048576-' \
   -H 'If-Range: "<sha256>"' \
   http://localhost:8080/api/firmware/releases/1.4.2/artifact -o part.bin
+
+# 运维切换某型号的活动固件（首次 expectedVersion 必须为 null）
+curl -f -X POST http://localhost:8080/api/firmware/models/WT-5000/active \
+  -H 'Content-Type: application/json' \
+  -d '{"releaseVersion":"1.4.2","expectedVersion":null}'
+# 后续升级：expectedVersion 传当前活动版本；并发竞争败者得到 409
+curl -f -X POST http://localhost:8080/api/firmware/models/WT-5000/active \
+  -H 'Content-Type: application/json' \
+  -d '{"releaseVersion":"1.5.0","expectedVersion":"1.4.2"}'
+
+# 设备始终从稳定地址取件（HEAD/Range/If-Range 与按版本下载完全一致）
+curl -f http://localhost:8080/api/firmware/models/WT-5000/artifact -o fw-active.bin
 ```
 
 ## 环境变量

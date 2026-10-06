@@ -4,7 +4,7 @@
 set -eu
 
 echo "=================== 1/3 代码测试（node --test） ==================="
-node --test test/range.test.js test/multipart.test.js test/store.test.js test/http.test.js
+node --test test/range.test.js test/multipart.test.js test/store.test.js test/http.test.js test/active.test.js
 
 echo "=================== 2/3 构建检查（node --check 语法校验） ==================="
 for f in src/*.js scripts/*.mjs; do

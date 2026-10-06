@@ -63,7 +63,35 @@ export function createServer({ dataDir, maxUploadBytes }) {
             sendError(res, 400, 'BAD_REQUEST', '版本号编码非法');
             return;
           }
-          await handleArtifact(req, res, version);
+          await handleReleaseArtifact(req, res, version);
+          return;
+        }
+        res.setHeader('Allow', 'GET, HEAD');
+        sendError(res, 405, 'METHOD_NOT_ALLOWED', `不支持的方法 ${req.method}`);
+        return;
+      }
+
+      // 型号维度：切换活动固件 POST .../active，设备稳定地址下载 GET|HEAD .../artifact
+      const modelM = /^\/api\/firmware\/models\/([^/]+)\/(active|artifact)\/?$/.exec(p);
+      if (modelM) {
+        let targetModel;
+        try {
+          targetModel = decodeURIComponent(modelM[1]);
+        } catch {
+          sendError(res, 400, 'BAD_REQUEST', '型号编码非法');
+          return;
+        }
+        if (modelM[2] === 'active') {
+          if (req.method === 'POST') {
+            await handleSetActive(req, res, targetModel);
+          } else {
+            res.setHeader('Allow', 'POST');
+            sendError(res, 405, 'METHOD_NOT_ALLOWED', `不支持的方法 ${req.method}`);
+          }
+          return;
+        }
+        if (req.method === 'GET' || req.method === 'HEAD') {
+          await handleActiveArtifact(req, res, targetModel);
           return;
         }
         res.setHeader('Allow', 'GET, HEAD');
@@ -128,13 +156,96 @@ export function createServer({ dataDir, maxUploadBytes }) {
     }
   }
 
-  async function handleArtifact(req, res, version) {
+  async function handleReleaseArtifact(req, res, version) {
     const meta = store.get(version);
     if (!meta || !VERSION_RE.test(version)) {
       sendError(res, 404, 'RELEASE_NOT_FOUND', `版本 ${version} 不存在`);
       return;
     }
+    await serveArtifact(req, res, meta);
+  }
 
+  async function handleActiveArtifact(req, res, targetModel) {
+    // 仅解析一次不可变发布件元数据：整个响应（头与字节）都锁定在该版本，
+    // 即便响应期间活动版本被切换，设备拿到的仍是最后一次成功切换时的完整发布件。
+    const meta = store.getActiveMeta(targetModel);
+    if (!meta) {
+      sendError(res, 404, 'ACTIVE_RELEASE_NOT_FOUND',
+        `型号 ${targetModel} 尚无活动固件`);
+      return;
+    }
+    await serveArtifact(req, res, meta);
+  }
+
+  async function handleSetActive(req, res, targetModel) {
+    if (!targetModel || targetModel.length > 128) {
+      sendError(res, 400, 'INVALID_TARGET_MODEL', 'targetModel 缺失或过长（最长 128）');
+      drain(req);
+      return;
+    }
+
+    let payload;
+    try {
+      payload = await readJsonBody(req, 64 * 1024);
+    } catch (err) {
+      sendError(res, err.status || 400, err.code || 'BAD_REQUEST', err.message);
+      return;
+    }
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      sendError(res, 400, 'INVALID_JSON_BODY', '请求体必须是 JSON 对象');
+      return;
+    }
+
+    const { releaseVersion, expectedVersion } = payload;
+    if (typeof releaseVersion !== 'string' || !VERSION_RE.test(releaseVersion.trim())) {
+      sendError(res, 400, 'INVALID_VERSION',
+        'releaseVersion 缺失或非法（允许 1-64 位字母数字与 ._+-，且首字符为字母数字）');
+      return;
+    }
+    // expectedVersion 必须显式给出：字符串版本号，或 null（首次切换必须为 null）
+    if (!('expectedVersion' in payload)) {
+      sendError(res, 400, 'INVALID_EXPECTED_VERSION',
+        'expectedVersion 缺失：必须是版本号字符串，首次切换时为 null');
+      return;
+    }
+    if (expectedVersion !== null
+      && (typeof expectedVersion !== 'string' || !VERSION_RE.test(expectedVersion.trim()))) {
+      sendError(res, 400, 'INVALID_EXPECTED_VERSION',
+        'expectedVersion 必须是版本号字符串或 null');
+      return;
+    }
+
+    try {
+      const rec = await store.setActive(
+        targetModel,
+        releaseVersion.trim(),
+        expectedVersion === null ? null : expectedVersion.trim(),
+      );
+      const meta = store.get(rec.version);
+      // ETag 与设备随后在稳定地址下载到的发布件 ETag 完全一致，可直接用于 If-Range
+      sendJson(res, 200, {
+        targetModel: rec.targetModel,
+        activeVersion: rec.version,
+        switchedAt: rec.switchedAt,
+        sha256: meta.sha256,
+        size: meta.size,
+      }, { ETag: etagOf(meta) });
+    } catch (err) {
+      if (err instanceof StoreError) {
+        sendError(res, err.status, err.code, err.message);
+      } else {
+        sendError(res, 500, 'INTERNAL_ERROR', `切换活动固件失败: ${err.message}`);
+      }
+    }
+  }
+
+  /**
+   * 不可变发布件下载管线（按版本下载与按型号稳定地址下载共用）：
+   * HEAD、Range（200/206/416）、If-Range、If-None-Match 语义完全一致，
+   * 单次响应的 ETag/Content-Length/Content-Range 与实际字节同属一个版本。
+   */
+  async function serveArtifact(req, res, meta) {
+    const version = meta.version;
     const filePath = store.artifactPath(version);
     const size = meta.size;
     const etag = etagOf(meta);
@@ -258,6 +369,33 @@ function pipeFile(rs, res) {
 
 function drain(req) {
   req.resume();
+}
+
+/** 读取并解析有大小上限的 JSON 请求体；非法 JSON / 超限抛出带 status 的错误 */
+async function readJsonBody(req, maxBytes) {
+  const chunks = [];
+  let len = 0;
+  for await (const chunk of req) {
+    len += chunk.length;
+    if (len > maxBytes) {
+      req.destroy();
+      const err = new Error(`请求体超过 ${maxBytes} 字节上限`);
+      err.status = 413;
+      err.code = 'PAYLOAD_TOO_LARGE';
+      throw err;
+    }
+    chunks.push(chunk);
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(Buffer.concat(chunks).toString('utf8') || 'null');
+  } catch {
+    const err = new Error('请求体不是合法 JSON');
+    err.status = 400;
+    err.code = 'INVALID_JSON_BODY';
+    throw err;
+  }
+  return parsed;
 }
 
 export async function startServer() {

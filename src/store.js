@@ -1,7 +1,8 @@
 // 固件发布存储：持久化到 DATA_DIR，发布动作原子化，重启后既有版本仍可下载。
 // 目录结构：
-//   <data>/staging/<id>/{artifact,meta.json}   发布中的暂存区
+//   <data>/staging/<id>/{artifact,meta.json}        发布中的暂存区
 //   <data>/releases/<version>/{artifact,meta.json}  已发布（不可变）
+//   <data>/active/<encodedModel>.json               型号 -> 活动版本映射（原子写入）
 import {
   createReadStream,
   createWriteStream,
@@ -36,13 +37,19 @@ export class FirmwareStore {
     this.dataDir = dataDir;
     this.releasesDir = path.join(dataDir, 'releases');
     this.stagingDir = path.join(dataDir, 'staging');
+    this.activeDir = path.join(dataDir, 'active');
     /** @type {Map<string, any>} version -> meta */
     this.meta = new Map();
+    /** @type {Map<string, any>} targetModel -> 活动记录 {version, switchedAt} */
+    this.active = new Map();
+    /** @type {Map<string, Promise<unknown>>} 按型号串行化活动切换，杜绝并发竞争产生混合状态 */
+    this.activeLocks = new Map();
   }
 
   async init() {
     await mkdir(this.releasesDir, { recursive: true });
     await mkdir(this.stagingDir, { recursive: true });
+    await mkdir(this.activeDir, { recursive: true });
     // 清理上次崩溃残留的暂存区
     let entries = [];
     try {
@@ -64,6 +71,34 @@ export class FirmwareStore {
         await access(path.join(this.releasesDir, e.name, 'artifact'));
         this.meta.set(meta.version, Object.freeze({ ...meta }));
       } catch { /* 残缺目录：忽略，不污染已发布视图 */ }
+    }
+
+    // 载入型号 -> 活动版本映射。映射只指向不可变发布件：
+    // 指向缺失/损坏发布件的记录视为孤儿，忽略（绝不回退到其他版本拼接）。
+    let actEntries = [];
+    try {
+      actEntries = await readdir(this.activeDir, { withFileTypes: true });
+    } catch { /* ignore */ }
+    // 清理崩溃残留的原子写临时文件
+    await Promise.all(
+      actEntries
+        .filter((e) => e.isFile() && e.name.includes('.tmp-'))
+        .map((e) => rm(path.join(this.activeDir, e.name), { force: true }).catch(() => {})),
+    );
+    for (const e of actEntries) {
+      if (!e.isFile() || !e.name.endsWith('.json')) continue;
+      try {
+        const rec = JSON.parse(await readFile(path.join(this.activeDir, e.name), 'utf8'));
+        if (!rec || typeof rec.targetModel !== 'string' || typeof rec.version !== 'string') continue;
+        if (e.name !== encodeModel(rec.targetModel)) continue;
+        const meta = this.meta.get(rec.version);
+        if (!meta || meta.targetModel !== rec.targetModel) continue;
+        this.active.set(rec.targetModel, Object.freeze({
+          targetModel: rec.targetModel,
+          version: rec.version,
+          switchedAt: typeof rec.switchedAt === 'string' ? rec.switchedAt : '',
+        }));
+      } catch { /* 残缺映射文件：忽略 */ }
     }
   }
 
@@ -173,6 +208,82 @@ export class FirmwareStore {
     if (range) return createReadStream(p, { start: range.start, end: range.end });
     return createReadStream(p);
   }
+
+  /** 某型号当前活动记录 {targetModel, version, switchedAt}，未切换过返回 null */
+  getActive(targetModel) {
+    return this.active.get(targetModel) || null;
+  }
+
+  /** 某型号当前活动发布件的不可变元数据；从未切换返回 null */
+  getActiveMeta(targetModel) {
+    const rec = this.active.get(targetModel);
+    return rec ? this.meta.get(rec.version) || null : null;
+  }
+
+  /**
+   * 将某型号的活动固件切换为指定发布版本。
+   * - 发布件不存在：RELEASE_NOT_FOUND(404)
+   * - 发布件型号与目标型号不一致：MODEL_MISMATCH(409)
+   * - expectedVersion 与切换前活动版本不符（首次切换须为 null）：VERSION_CONFLICT(409)
+   * 切换以“读旧映射 → 校验 → 原子替换文件 → 更新内存”为临界区，按型号串行，
+   * 因此并发竞争只有一个请求成功，其余拿到 409 且活动版本保持为最后一次成功切换。
+   */
+  async setActive(targetModel, releaseVersion, expectedVersion) {
+    if (!targetModel || targetModel.length > 128) {
+      throw new StoreError('targetModel 缺失或过长（最长 128）', 400, 'INVALID_TARGET_MODEL');
+    }
+    return this.#withActiveLock(targetModel, async () => {
+      const meta = this.meta.get(releaseVersion);
+      if (!meta) {
+        throw new StoreError(`发布版本 ${releaseVersion} 不存在`, 404, 'RELEASE_NOT_FOUND');
+      }
+      if (meta.targetModel !== targetModel) {
+        throw new StoreError(
+          `发布版本 ${releaseVersion} 的型号为 ${meta.targetModel}，无法切换到型号 ${targetModel}`,
+          409,
+          'MODEL_MISMATCH',
+        );
+      }
+      const current = this.active.get(targetModel) || null;
+      const currentVersion = current ? current.version : null;
+      if (expectedVersion !== currentVersion) {
+        throw new StoreError(
+          currentVersion === null
+            ? `型号 ${targetModel} 从未切换活动固件，expectedVersion 必须为 null`
+            : `前置版本不匹配：expectedVersion=${formatExpected(expectedVersion)}，当前活动版本为 ${currentVersion}`,
+          409,
+          'VERSION_CONFLICT',
+        );
+      }
+
+      const record = {
+        targetModel,
+        version: releaseVersion,
+        switchedAt: new Date().toISOString(),
+      };
+      // 先写新映射文件再更新内存；原子 rename 保证重启后看到的是完整记录
+      const file = path.join(this.activeDir, encodeModel(targetModel));
+      await writeFileAtomic(file, JSON.stringify(record, null, 2) + '\n');
+      const frozen = Object.freeze({ ...record });
+      this.active.set(targetModel, frozen);
+      return frozen;
+    });
+  }
+
+  /** 按型号串行执行活动切换临界区 */
+  async #withActiveLock(targetModel, fn) {
+    const prev = this.activeLocks.get(targetModel) || Promise.resolve();
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    // 后继者无论前任成败都要进入，但必须等前任完全退出临界区
+    this.activeLocks.set(targetModel, prev.then(() => gate, () => gate));
+    try {
+      await prev;
+      return await fn();
+    } finally {
+      release();
+    }
+  }
 }
 
 async function writeFileAtomic(p, data) {
@@ -198,6 +309,19 @@ function hashFile(p) {
     rs.on('data', (c) => hash.update(c));
     rs.on('end', () => resolve(hash.digest('hex')));
   });
+}
+
+/**
+ * 型号名 -> 活动映射文件名。型号可含非 ASCII 字符与路径分隔符，不能直接做文件名，
+ * 也不宜做转义（转义结果仍可能超出 255 字节限制），故采用 SHA-256 定长摘要；
+ * 映射文件内部完整记录 targetModel，载入时重新核对。
+ */
+function encodeModel(model) {
+  return `model-${createHash('sha256').update(model, 'utf8').digest('hex')}.json`;
+}
+
+function formatExpected(v) {
+  return v === null ? 'null' : JSON.stringify(v);
 }
 
 // 供上传解析器使用的 createWriteStream 再导出（保持引用集中）

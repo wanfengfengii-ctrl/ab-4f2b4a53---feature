@@ -137,3 +137,136 @@ test('重启后既有版本仍可下载，残留 staging 被清理', async () =>
   assert.ok(onDisk.equals(data));
   assert.deepEqual(await readdir(path.join(dataDir, 'staging')), []);
 });
+
+async function publishRelease(store, dataDir, version, targetModel, data) {
+  const tmp = await makeTmpFile(dataDir, data);
+  return store.publish({
+    fields: { version, targetModel, sha256: sha(data) },
+    file: { path: tmp, size: data.length, sha256: sha(data), filename: `${version}.bin`, contentType: 'x' },
+  });
+}
+
+test('活动切换：首次须 expectedVersion=null，再次切换须匹配前置版本', async () => {
+  const dataDir = path.join(root, 'active-ok');
+  const store = new FirmwareStore(dataDir);
+  await store.init();
+  await publishRelease(store, dataDir, '1.0.0', 'WT-A', Buffer.from('a-one'));
+  await publishRelease(store, dataDir, '1.1.0', 'WT-A', Buffer.from('a-two'));
+
+  // 首次切换误传字符串 → 409
+  await assert.rejects(
+    store.setActive('WT-A', '1.0.0', '0.9.0'),
+    (err) => err.status === 409 && err.code === 'VERSION_CONFLICT',
+  );
+  assert.equal(store.getActive('WT-A'), null);
+
+  // 首次切换 null → 成功
+  const rec1 = await store.setActive('WT-A', '1.0.0', null);
+  assert.equal(rec1.version, '1.0.0');
+  assert.equal(store.getActiveMeta('WT-A').version, '1.0.0');
+
+  // 前置版本过期（null 或错误版本）→ 409，活动版本不变
+  await assert.rejects(
+    store.setActive('WT-A', '1.1.0', null),
+    (err) => err.status === 409 && err.code === 'VERSION_CONFLICT',
+  );
+  await assert.rejects(
+    store.setActive('WT-A', '1.1.0', '9.9.9'),
+    (err) => err.status === 409 && err.code === 'VERSION_CONFLICT',
+  );
+  assert.equal(store.getActive('WT-A').version, '1.0.0');
+
+  // 正确前置版本 → 成功
+  const rec2 = await store.setActive('WT-A', '1.1.0', '1.0.0');
+  assert.equal(rec2.version, '1.1.0');
+  assert.equal(store.getActiveMeta('WT-A').version, '1.1.0');
+});
+
+test('活动切换：未知发布 404、型号不符 409', async () => {
+  const dataDir = path.join(root, 'active-errors');
+  const store = new FirmwareStore(dataDir);
+  await store.init();
+  await publishRelease(store, dataDir, '2.0.0', 'WT-A', Buffer.from('a'));
+
+  await assert.rejects(
+    store.setActive('WT-A', 'nope', null),
+    (err) => err.status === 404 && err.code === 'RELEASE_NOT_FOUND',
+  );
+  // 型号一致的发布件才能切到该型号
+  await assert.rejects(
+    store.setActive('WT-B', '2.0.0', null),
+    (err) => err.status === 409 && err.code === 'MODEL_MISMATCH',
+  );
+  assert.equal(store.getActive('WT-A'), null);
+  assert.equal(store.getActive('WT-B'), null);
+});
+
+test('并发切换同一型号：仅一个成功，其余 409 且活动版本停留在成功版本', async () => {
+  const dataDir = path.join(root, 'active-race');
+  const store = new FirmwareStore(dataDir);
+  await store.init();
+  await publishRelease(store, dataDir, '1.0.0', 'WT-RACE', Buffer.from('r1'));
+  await publishRelease(store, dataDir, '1.0.1', 'WT-RACE', Buffer.from('r2'));
+
+  // 两个请求都以 null 为前置：首次只能一个赢
+  const results = await Promise.allSettled([
+    store.setActive('WT-RACE', '1.0.0', null),
+    store.setActive('WT-RACE', '1.0.1', null),
+  ]);
+  const fulfilled = results.filter((r) => r.status === 'fulfilled');
+  const rejected = results.filter((r) => r.status === 'rejected');
+  assert.equal(fulfilled.length, 1);
+  assert.equal(rejected.length, 1);
+  assert.equal(rejected[0].reason.status, 409);
+  assert.equal(rejected[0].reason.code, 'VERSION_CONFLICT');
+  const winner = fulfilled[0].value.version;
+  assert.equal(store.getActive('WT-RACE').version, winner);
+
+  // 链式竞争：双方都以赢家版本为前置切向不同新版本，同样只能一个赢
+  await publishRelease(store, dataDir, '1.1.0', 'WT-RACE', Buffer.from('r3'));
+  await publishRelease(store, dataDir, '1.2.0', 'WT-RACE', Buffer.from('r4'));
+  const race2 = await Promise.allSettled([
+    store.setActive('WT-RACE', '1.1.0', winner),
+    store.setActive('WT-RACE', '1.2.0', winner),
+  ]);
+  assert.equal(race2.filter((r) => r.status === 'fulfilled').length, 1);
+  const loser = race2.find((r) => r.status === 'rejected').reason;
+  assert.equal(loser.status, 409);
+  assert.equal(loser.code, 'VERSION_CONFLICT');
+  assert.ok(['1.1.0', '1.2.0'].includes(store.getActive('WT-RACE').version));
+});
+
+test('不同型号的活动映射互不影响', async () => {
+  const dataDir = path.join(root, 'active-multi');
+  const store = new FirmwareStore(dataDir);
+  await store.init();
+  await publishRelease(store, dataDir, '1.0.0', 'WT-A', Buffer.from('a'));
+  await publishRelease(store, dataDir, '3.0.0', 'WT-B', Buffer.from('b'));
+  await store.setActive('WT-A', '1.0.0', null);
+  await store.setActive('WT-B', '3.0.0', null);
+  assert.equal(store.getActiveMeta('WT-A').version, '1.0.0');
+  assert.equal(store.getActiveMeta('WT-B').version, '3.0.0');
+});
+
+test('活动映射经重启保持，且仍指向同一不可变发布件', async () => {
+  const dataDir = path.join(root, 'active-restart');
+  const s1 = new FirmwareStore(dataDir);
+  await s1.init();
+  const d1 = Buffer.from('active-persist-壹');
+  const d2 = Buffer.from('active-persist-贰');
+  await publishRelease(s1, dataDir, '1.0.0', 'WT-P', d1);
+  await publishRelease(s1, dataDir, '2.0.0', 'WT-P', d2);
+  await s1.setActive('WT-P', '1.0.0', null);
+  await s1.setActive('WT-P', '2.0.0', '1.0.0');
+
+  const s2 = new FirmwareStore(dataDir);
+  await s2.init();
+  const rec = s2.getActive('WT-P');
+  assert.ok(rec);
+  assert.equal(rec.version, '2.0.0');
+  assert.equal(rec.targetModel, 'WT-P');
+  const meta = s2.getActiveMeta('WT-P');
+  assert.equal(meta.sha256, sha(d2));
+  const onDisk = await readFile(s2.artifactPath('2.0.0'));
+  assert.ok(onDisk.equals(d2));
+});
